@@ -63,13 +63,15 @@ allMeals=()=>Object.entries(db.days).flatMap(([k,d])=>d.meals.map(m=>({...m,date
 find=id=>allMeals().concat(db.favs).find(m=>m.id==id),
 fd=(k,o)=>new Date(k+'T12:00').toLocaleDateString('he-IL',o);
 
+async function TF(u,o={}){const w=u.includes('nal.usda')?'USDA':u.includes('generativelanguage')?'Gemini':'Open Food Facts',t=w==='Gemini'?40000:15000;
+ try{return await fetch(u,{...o,signal:AbortSignal.timeout(t)})}catch(e){throw new Error(w+': '+(e.name==='TimeoutError'?'לא ענה תוך '+t/1000+' שניות':'שגיאת רשת או חסימה ('+e.message+')'))}}
 const K=()=>{try{return JSON.parse(localStorage["nt.keys"]||"{}")}catch{return{}}},GM="gemini-flash-latest";
 // ---- AI layer: replace this one function to switch model or provider ----
 async function ai(prompt,schema){
   if(!K().g)throw new Error('חסר מפתח Gemini — לשונית היסטוריה ← מפתחות API');
-  const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GM}:generateContent`,{method:'POST',headers:{'content-type':'application/json','x-goog-api-key':K().g},
+  const r=await TF(`https://generativelanguage.googleapis.com/v1beta/models/${K().m||GM}:generateContent`,{method:'POST',headers:{'content-type':'application/json','x-goog-api-key':K().g},
     body:JSON.stringify({contents:[{parts:[{text:prompt}]}],generationConfig:{responseMimeType:'application/json',responseSchema:schema,temperature:0.2}})});
-  if(!r.ok)throw new Error(`Gemini ${r.status}: ${(await r.text()).slice(0,160)}`);
+  if(!r.ok){const t=await r.text();let m=t;try{m=JSON.parse(t).error.message}catch{}throw new Error('Gemini '+r.status+': '+m.slice(0,140)+(r.status===429?' — חרגת ממגבלת הבקשות, נסה שוב בעוד דקה':''))}
   const j=await r.json();return JSON.parse(j.candidates[0].content.parts.map(p=>p.text||'').join(''));
 }
 const TT=type=>({type}),PSCHEMA={type:'OBJECT',required:['items','meal'],properties:{meal:{type:'STRING',enum:['breakfast','lunch','dinner','snack']},clarification:{type:'STRING',nullable:true},
@@ -87,35 +89,34 @@ const PICK='For each food below choose the index of the candidate that best matc
 const num=x=>Math.round((+x||0)*10)/10,nut=(a,id)=>((a||[]).find(x=>x.nutrientId===id)||{}).value||0;
 async function usda(q,branded){
   const dt=branded?'Branded':'Foundation,SR%20Legacy,Survey%20(FNDDS)';
-  const r=await fetch(`https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${K().u||'DEMO_KEY'}&pageSize=6&dataType=${dt}&query=${encodeURIComponent(q)}`);
+  const r=await TF(`https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${K().u||'DEMO_KEY'}&pageSize=6&dataType=${dt}&query=${encodeURIComponent(q)}`);
   if(!r.ok)throw new Error('USDA '+r.status+(r.status==429?' (מכסה מלאה — הוסף מפתח USDA)':''));
   return((await r.json()).foods||[]).map(f=>{const n=f.foodNutrients;return{id:'usda:'+f.fdcId,src:'USDA',name:f.description+(f.brandName?` (${f.brandName})`:''),
     per100:{kcal:num(nut(n,1008)||nut(n,2047)||nut(n,2048)),p:num(nut(n,1003)),c:num(nut(n,1005)),f:num(nut(n,1004))}}});
 }
 const off=p=>{const n=p.nutriments||{};return{id:'off:'+p.code,src:'OFF',name:[p.product_name,p.brands].filter(Boolean).join(' — '),per100:{kcal:num(n['energy-kcal_100g']),p:num(n.proteins_100g),c:num(n.carbohydrates_100g),f:num(n.fat_100g)}}};
 async function offSearch(q){
-  const r=await fetch(`https://world.openfoodfacts.org/cgi/search.pl?search_simple=1&action=process&json=1&page_size=5&fields=code,product_name,brands,nutriments&search_terms=${encodeURIComponent(q)}`);
+  const r=await TF(`https://world.openfoodfacts.org/cgi/search.pl?search_simple=1&action=process&json=1&page_size=5&fields=code,product_name,brands,nutriments&search_terms=${encodeURIComponent(q)}`);
   if(!r.ok)throw new Error('OpenFoodFacts '+r.status);
   return((await r.json()).products||[]).filter(p=>p.product_name&&p.nutriments&&p.nutriments['energy-kcal_100g']!=null).map(off);
 }
 // packaged=true: USDA Branded + OFF; false: USDA generic only; undefined (manual search): USDA generic + OFF
 async function search(q,packaged){
   const res=await Promise.allSettled([usda(q,packaged===true),packaged===false?[]:offSearch(q)]);
-  if(res.every(x=>x.status==='rejected'))throw res[0].reason;
-  return res.flatMap(x=>x.status==='fulfilled'?x.value:[]);
+  const out=res.flatMap(x=>x.status==='fulfilled'?x.value:[]);if(!out.length){const bad=res.find(x=>x.status==='rejected');if(bad)throw bad.reason}return out;
 }
 
 // ---- Meal analysis: parse -> look up candidates -> AI picks best match ----
 async function analyze(text){
   const p=await ai(PARSE+text,PSCHEMA);
-  const items=await Promise.all(p.items.slice(0,15).map(async it=>({...it,cands:(await search(it.query,it.packaged).catch(()=>[])).slice(0,8)})));
-  let picks=[];
+  const errs=[];const items=await Promise.all(p.items.slice(0,15).map(async it=>({...it,cands:(await search(it.query,it.packaged).catch(e=>{errs.push(e.message);return[]})).slice(0,8)})));
+  if(items.length&&errs.length===items.length)throw new Error(errs[0]);let picks=[];
   try{picks=(await ai(PICK+JSON.stringify(items.map(i=>({food:i.query,candidates:i.cands.map(c=>c.name)}))),KSCHEMA)).picks}catch{}
   return{clarification:p.clarification||null,meal:p.meal,items:items.map((it,i)=>{const k=Number.isInteger(picks[i])?picks[i]:-1,c=it.cands[k]||it.cands[0]||null;
     return{name:it.name,g:it.grams,assumed:it.assumed,food:c&&{...c,closest:!it.cands[k]},cands:it.cands}})};
 }
 
-async function barcode(c){c=String(c||'').replace(/\D/g,'');const j=await(await fetch(`https://world.openfoodfacts.org/api/v2/product/${c}.json?fields=product_name,brands,nutriments,serving_quantity`)).json();
+async function barcode(c){c=String(c||'').replace(/\D/g,'');const j=await(await TF(`https://world.openfoodfacts.org/api/v2/product/${c}.json?fields=product_name,brands,nutriments,serving_quantity`)).json();
  if(j.status!==1)throw Error('המוצר לא נמצא ב-Open Food Facts');return{food:off({...j.product,code:c}),g:+j.product.serving_quantity||100}}
 async function api(p,b){const[n,qs]=p.split('?'),q=new URLSearchParams(qs||'');
  if(n==='analyze')return analyze(String(b.text||'').slice(0,1500));
@@ -137,7 +138,7 @@ function home(){const dy=day(S.date),t=tot(dy.meals.flatMap(m=>m.items)),pc=Math
 
 const histList=()=>{const q=S.q.trim().toLowerCase(),L=(S.fav?db.favs.map(m=>({...m,date:''})):allMeals()).filter(m=>!q||(m.text+m.items.map(i=>i.name+' '+i.fname).join(' ')).toLowerCase().includes(q));
  return L.length?L.map(m=>mealCard(m,m.date?fd(m.date,{day:'numeric',month:'short'}):'',true)).join(''):'<p class=empty>לא נמצאו ארוחות.</p>'};
-const hist=()=>`<header><span>היסטוריה</span><button class="${S.fav?'on':''}" data-a=favf>★ מועדפים</button></header><input id=q placeholder="חיפוש בארוחות קודמות…" value="${esc(S.q)}"><div id=hl>${histList()}</div><button class=lnk data-a=exp>גיבוי הנתונים (JSON)</button> <button class=lnk data-a=keys>מפתחות API</button>`;
+const hist=()=>`<header><span>היסטוריה</span><button class="${S.fav?'on':''}" data-a=favf>★ מועדפים</button></header><input id=q placeholder="חיפוש בארוחות קודמות…" value="${esc(S.q)}"><div id=hl>${histList()}</div><button class=lnk data-a=exp>גיבוי הנתונים (JSON)</button> <button class=lnk data-a=keys>מפתחות API</button> <button class=lnk data-a=test>בדיקת חיבור</button>`;
 function render(a){$('#app').classList.toggle('still',!a);$('#app').innerHTML=S.tab==='today'?home():hist();document.querySelectorAll('nav [data-t]').forEach(b=>b.classList.toggle('on',b.dataset.t===S.tab))}
 
 const rep=(it,i)=>`<div class=rep><div class=row><input id=rs${i} placeholder="חפש מזון (עדיף באנגלית)"><button data-a=rs data-i=${i}>חפש</button></div>${(it.cands||[]).map((c,j)=>`<button class=cand data-a=pick data-i=${i} data-j=${j}><b>${esc(c.name)}</b><small>${c.src} · ${per(c.per100)}</small></button>`).join('')}</div>`,
@@ -182,7 +183,11 @@ const A={
  del:d=>{if(confirm('למחוק את הארוחה?')){const y=day(S.date);y.meals=y.meals.filter(m=>m.id!=d.id);persist();render()}},
  exp:()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(db)],{type:'application/json'}));a.download='nutritrack-backup.json';a.click()},
  keys:()=>{const k=JSON.parse(localStorage['nt.keys']||'{}'),g=prompt('מפתח Gemini (ריק = ללא שינוי)');if(g===null)return;const u=prompt('מפתח USDA (ריק = ללא שינוי)');if(u===null)return;
-  localStorage['nt.keys']=JSON.stringify({g:g.trim()||k.g||'',u:u.trim()||k.u||''});alert('המפתחות נשמרו בטלפון הזה בלבד')}
+  const m=prompt('מודל Gemini (ריק = ללא שינוי, "-" = ברירת מחדל)');if(m===null)return;localStorage['nt.keys']=JSON.stringify({g:g.trim()||k.g||'',u:u.trim()||k.u||'',m:m.trim()==='-'?'':m.trim()||k.m||''});alert('המפתחות נשמרו בטלפון הזה בלבד')},
+ async test(){const b=$('[data-a=test]'),m=[],s=t=>Math.round((Date.now()-t)/1000)+' שנ׳';b.textContent='בודק…';let t=Date.now();
+  try{await ai('Reply with JSON {"ok":true}',{type:'OBJECT',properties:{ok:{type:'BOOLEAN'}}});m.push('Gemini: תקין ✓ ('+s(t)+')')}catch(e){m.push(e.message)}
+  t=Date.now();try{const f=await usda('boiled egg');m.push('USDA: תקין ✓ ('+f.length+' תוצאות, '+s(t)+')')}catch(e){m.push(e.message)}
+  b.textContent='בדיקת חיבור';alert(m.join('\n'))}
 };
 document.addEventListener('click',e=>{const b=e.target.closest('[data-a]');if(b&&A[b.dataset.a])A[b.dataset.a](b.dataset)});
 document.addEventListener('change',e=>{if(e.target.id==='dp'&&e.target.value){S.date=e.target.value;render(1)}});
